@@ -847,8 +847,8 @@ function getHomePage() {
 
       <div class="examples">
         <span class="label">Try:</span>
-        <a href="/------https://duckduckgo.com">DuckDuckGo</a>		
-        <a href="/------https://www.youtube.com/">YouTube</a>
+        <a href="/------https://ext.to/">Ext</a>		
+        <a href="/------https://browserleaks.com/ip">BrowserLeaks</a>
       </div>
     </div>
   </main>
