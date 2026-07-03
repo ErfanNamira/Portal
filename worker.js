@@ -647,7 +647,7 @@ button svg { width: 15px; height: 15px; }
 
   <form class="bar" onsubmit="navigate(event)">
     <span class="bar-flag mono">https://</span>
-    <input type="text" id="url" placeholder="youtube.com" autofocus autocomplete="off" spellcheck="false">
+    <input type="text" id="url" placeholder="github.com" autofocus autocomplete="off" spellcheck="false">
     <button type="submit">
       Go
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
