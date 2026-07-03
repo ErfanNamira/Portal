@@ -1,60 +1,76 @@
-# Portal Proxy 🌐
+# 🌐 Portal: Advanced Cloudflare Worker Web Proxy
 
-A fast, private, and authenticated web proxy built entirely on Cloudflare Workers. Portal Proxy allows you to bypass restrictions and browse the web privately through a beautifully designed, modern interface. 
+**Portal** is a powerful, single-file web proxy built entirely on Cloudflare Workers. It goes beyond simple request forwarding by implementing deep server-side HTML/CSS rewriting and aggressive client-side DOM interception. 
 
-It utilizes Cloudflare's edge network and `HTMLRewriter` to seamlessly stream and rewrite HTML, CSS, and JavaScript on the fly, ensuring external links and assets load correctly through the proxy.
+Designed for privacy, bypassing basic geo-restrictions, and accessing content securely, Portal features a custom-built UI, streaming media support, and intelligent Cloudflare Challenge handling.
 
-## ✨ Features
+---
 
-* **Edge-Rendered Modern UI:** A clean, responsive login and homepage interface styled with modern aesthetics.
-* **Authentication:** Secure access using Basic Authentication with fallback to 30-day encrypted session cookies.
-* **On-the-Fly Rewriting:** Uses `HTMLRewriter` to dynamically rewrite attributes like `href`, `src`, and `action` so you stay within the proxy context.
-* **CSS & JS Processing:** Automatically intercepts and rewrites URLs inside stylesheets and scripts.
-* **Browser Emulation:** Spoofs standard Chrome user-agent and `Sec-Fetch` headers to bypass basic anti-bot protections.
-* **Edge Caching:** Caches static assets at the edge to reduce load and improve speed.
-* **Smart Fallbacks:** Handles redirects and falls back to DuckDuckGo searches if a URL is incomplete.
+## ✨ Key Features
+
+### 🧠 Intelligent Routing & Interception
+* **Client-Side DOM Hijacking**: Intercepts `fetch`, `XMLHttpRequest`, `EventSource`, `window.open`, and the History API to route dynamic traffic.
+* **Deep Property Interception**: Uses `Object.defineProperty` to intercept dynamic DOM property assignments (e.g., `img.src`, `a.href`, `form.action`).
+* **MutationObserver**: Automatically rewrites URLs for nodes dynamically injected into the DOM by target site scripts.
+* **Service Worker Blocking**: Prevents target sites from registering Service Workers, which would otherwise cache and break proxy routing.
+
+### 🛠️ Server-Side Rewriting
+* **HTMLRewriter Integration**: Streams and modifies HTML on the edge, rewriting `src`, `href`, `srcset`, and inline styles before they reach the browser.
+* **CSS & Manifest Parsing**: Natively rewrites `@import` and `url()` in CSS files, as well as HLS (`.m3u8`) and DASH (`.mpd`) streaming manifests for seamless video playback.
+* **Header Sanitization**: Strips restrictive security headers (CSP, X-Frame-Options, HSTS) and rewrites `Set-Cookie` paths to isolate cookies per target domain.
+
+### 🛡️ Anti-Bot & Challenge Bypass
+* **Smart CAPTCHA Passthrough**: Domains like `hcaptcha.com`, `challenges.cloudflare.com`, and `turnstile.com` are automatically whitelisted to load directly, ensuring CAPTCHAs work perfectly.
+* **CF Challenge Detection**: Detects Cloudflare 403/503 Challenge pages, temporarily disables client-side JS injection to prevent breaking the challenge, and rewrites challenge URLs server-side.
+* **Browser Emulation**: Spoofs `User-Agent`, `Sec-CH-UA`, and `Accept` headers to mimic a modern Chrome 150 browser on Windows 10.
+
+### 🎨 Premium UI & UX
+* **Custom "Portal" Homepage**: A sleek, cyberpunk-inspired routing interface with animated SVG backgrounds.
+* **Dark/Light Mode**: Fully responsive themes with local storage persistence.
+* **Secure Authentication**: Optional Basic Auth and secure, HttpOnly cookie-based session management with a custom login portal.
+
+---
 
 ## 🚀 Deployment
 
-You can deploy this entirely through your browser using the Cloudflare Dashboard, without needing Node.js or any local software.
+Since this is a single-file project, deployment is incredibly simple.
 
-### 1. Create a New Worker
-* Log in to your [Cloudflare Dashboard](https://dash.cloudflare.com/).
-* Navigate to **Workers & Pages** on the left sidebar.
-* Click **Create application**, then **Create Worker**.
-* Give it a name (e.g., `portal-proxy`) and click **Deploy**.
-
-### 2. Add the Code
-* Click **Edit code** on your newly deployed Worker.
-* Delete the default code and paste the entire contents of `worker.js`.
-* Update the `config.proxyDomains` array at the top of the file to include your new `.workers.dev` URL (e.g., `['portal-proxy.your-username.workers.dev']`).
-* Click **Save and deploy** in the top right corner.
-
-### 3. Set Up Authentication Secrets
-To secure your proxy, you must add your desired username and password as environment variables.
-
-* Go back to your Worker's overview page.
-* Go to **Settings** > **Variables**.
-* Under **Environment Variables**, click **Add variable**.
-* Add `PROXY_USER` and type your desired username, then click the **Encrypt** button.
-* Click **Add variable** again, add `PROXY_PASS`, enter your password, and click the **Encrypt** button.
-* Click **Deploy** to save the changes.
+### Method 1: Cloudflare Dashboard (Easiest)
+1. Log in to your Cloudflare Dashboard.
+2. Navigate to **Workers & Pages** > **Create** > **Create Worker**.
+3. Name your worker (e.g., `portal-proxy`) and click **Deploy**.
+4. Click **Edit Code** to open the Quick Editor.
+5. Delete the default boilerplate code and paste the entire contents of your `worker.js` file.
+6. Click **Save and Deploy**.
 
 ## ⚙️ Configuration
 
-You can customize the proxy behavior by modifying the `config` object at the top of `worker.js`:
+Portal uses Cloudflare Environment Variables for authentication. Go to your Worker's Settings > Variables to configure them.
+| Variable      | Description                                     | Required? |
+|---------------|-------------------------------------------------|-----------|
+| `PROXY_USER`  | The username required to access the proxy.      | Optional* |
+| `PROXY_PASS`  | The password required to access the proxy.      | Optional* |
 
-* `proxyDomains`: Must contain the domain(s) your worker is running on to prevent unauthorized errors.
-* `separator`: The string used to separate the proxy URL from the target URL (default: `------`).
-* `allowedDomains`: Whitelist specific domains for strict access (leave empty to allow all).
-* `browserEmulation`: Modify headers like `User-Agent` to disguise proxy traffic.
-* `cacheTTL`: Adjust how long static assets are cached at the edge (default: `3600` seconds).
+**If both variables are left blank or unset, the proxy will be public and will bypass the login screen.**
 
-## 🛡️ Security & Privacy
+## 📖 Customization (Inside the Code)
 
-* **Header Stripping:** This proxy removes strict `Content-Security-Policy` and `X-Frame-Options` headers to allow seamless rendering.
-* **Edge Encryption:** Traffic between your device and the proxy is encrypted via Cloudflare's SSL.
-* **IP Masking:** All external requests are initiated from Cloudflare's edge network, keeping your true IP address hidden from target servers.
+You can customize the proxy's behavior by editing the `CONFIG` object at the top of the file.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `separator` | The string used to separate the proxy host from the target URL. | `------` |
+| `cacheTTL` | Edge cache duration for static assets, in seconds. | `86400` (24 hours) |
+| `PASSTHROUGH_DOMAINS` | An array of domains that should bypass the proxy entirely. This is essential for WebSockets, CAPTCHAs, and certain CDNs. | See `CONFIG` |
+
+## ⚠️ Limitations & Disclaimer
+**Complex DRMs:** Proxies cannot bypass hardware-level DRM (Widevine L1, PlayReady) used by Netflix, Hulu, etc.
+
+**WebRTC/IP Leaks:** This proxy routes HTTP/HTTPS traffic. It does not tunnel WebRTC or UDP traffic.
+
+**Strict Origin Protections:** Some highly protected sites (e.g., banking, advanced bot-protected ticketing sites) may still detect the proxy environment via canvas fingerprinting or TLS fingerprinting (JA3).
+
+**Disclaimer:** This project is provided for **educational, privacy, and testing purposes only.** The developers are not responsible for any misuse or violation of third-party Terms of Service. Please use responsibly and legally.
 
 ## 📄 License
 
