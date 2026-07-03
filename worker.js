@@ -45,8 +45,11 @@ function getCookie(request, name) {
   if (cookieString) {
     const cookies = cookieString.split(';');
     for (let cookie of cookies) {
-      const [cookieName, cookieVal] = cookie.split('=');
-      if (cookieName.trim() === name) return cookieVal;
+      const eqIndex = cookie.indexOf('=');
+      if (eqIndex === -1) continue;
+      const cookieName = cookie.slice(0, eqIndex).trim();
+      const cookieVal = cookie.slice(eqIndex + 1).trim();
+      if (cookieName === name) return cookieVal;
     }
   }
   return null;
