@@ -48,10 +48,8 @@ Since this is a single-file project, deployment is incredibly simple.
 Portal uses Cloudflare Environment Variables for authentication. Go to your Worker's Settings > Variables to configure them.
 | Variable      | Description                                     | Required? |
 |---------------|-------------------------------------------------|-----------|
-| `PROXY_USER`  | The username required to access the proxy.      | Optional* |
-| `PROXY_PASS`  | The password required to access the proxy.      | Optional* |
-
-**If both variables are left blank or unset, the proxy will be public and will bypass the login screen.**
+| `PROXY_USER`  | The username required to access the proxy.      | No* |
+| `PROXY_PASS`  | The password required to access the proxy.      | No* |
 
 ## 📖 Customization (Inside the Code)
 
