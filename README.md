@@ -4,6 +4,8 @@
 
 Designed for privacy, bypassing basic geo-restrictions, and accessing content securely, Portal features a custom-built UI, streaming media support, and intelligent Cloudflare Challenge handling.
 
+<img src="https://raw.githubusercontent.com/ErfanNamira/Portal/main/images/Portal-v1.0.0.png" alt="Portal v1.0.0" width="100%">
+
 ---
 
 ## ✨ Key Features
