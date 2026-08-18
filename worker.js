@@ -16,12 +16,20 @@ const CONFIG = {
     }
 };
 
-// Domains that should bypass the proxy and load directly (Crucial for CAPTCHAs)
-const PASSTHROUGH_DOMAINS = [
+const PASSTHROUGH_DOMAINS = new Set([
     'hcaptcha.com', 
     'challenges.cloudflare.com', 
-    'turnstile.com'
-];
+    'turnstile.com',
+    'recaptcha.net',
+    'recaptcha.com'
+]);
+
+function isPassthrough(host) {
+    for (const d of PASSTHROUGH_DOMAINS) {
+        if (host === d || host.endsWith('.' + d)) return true;
+    }
+    return false;
+}
 
 // ==========================================
 // 2. JS INJECTION
@@ -29,13 +37,9 @@ const PASSTHROUGH_DOMAINS = [
 const JS_INJECTION = `
 <script>
 (function() {
-    // Skip injection for ad iframes to prevent breaking them and showing raw text
-    if (window.top !== window.self && window.location.search.includes('_proxy_iframe=1')) return;
-
     const SEP = '${CONFIG.separator}';
     const HOST = location.host;
     const ORIGIN = location.origin;
-    const PASSTHROUGH = ${JSON.stringify(PASSTHROUGH_DOMAINS)};
 
     // 0. Block Service Workers (Crucial for Reddit, YouTube, etc.)
     if (navigator.serviceWorker) {
@@ -55,7 +59,7 @@ const JS_INJECTION = `
             const abs = new URL(testUrl, location.href);
 
             // Passthrough for CAPTCHA and CF Challenge
-            if (PASSTHROUGH.some(d => abs.host.endsWith(d) || abs.host === d || abs.pathname.includes('/' + d + '/'))) return url;
+            if (${JSON.stringify([...PASSTHROUGH_DOMAINS])}.some(d => abs.host === d || abs.host.endsWith('.' + d))) return url;
 
             // Relative URL on proxy host. Map back to target origin.
             if (abs.host === HOST) {
@@ -70,6 +74,27 @@ const JS_INJECTION = `
             }
             return url;
         } catch(e) { return url; }
+    }
+
+    // Helper to rewrite srcset strings (Regex-free for safety and speed)
+    function rewriteSrcset(val) {
+        return val.split(',').map(part => {
+            let url = part.trim();
+            let rest = '';
+            for (let i = 0; i < url.length; i++) {
+                if (url.charCodeAt(i) <= 32) {
+                    rest = url.substring(i).trim();
+                    url = url.substring(0, i).trim();
+                    break;
+                }
+            }
+            if (!url || url.startsWith('data:')) return part;
+            try {
+                const proxied = toProxy(url);
+                if (proxied !== url) return proxied + (rest ? ' ' + rest : '');
+            } catch {}
+            return part;
+        }).join(', ');
     }
 
     // 1. Fetch API & Request Objects
@@ -92,29 +117,48 @@ const JS_INJECTION = `
         return origOpen.apply(this, [m, toProxy(u), ...a]);
     };
 
-    // 3. WebSocket (Passthrough to avoid breaking live chat/streams)
+    // 3. WebSocket & EventSource (SSE)
+    const OrigWebSocket = window.WebSocket;
+    if (OrigWebSocket) {
+        window.WebSocket = function(url, protocols) {
+            try {
+                let proxiedUrl = toProxy(url);
+                if (proxiedUrl.startsWith('http')) proxiedUrl = proxiedUrl.replace(/^http/, 'ws');
+                return new OrigWebSocket(proxiedUrl, protocols);
+            } catch (e) {
+                return new OrigWebSocket(url, protocols);
+            }
+        };
+        window.WebSocket.prototype = OrigWebSocket.prototype;
+        window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+        window.WebSocket.OPEN = OrigWebSocket.OPEN;
+        window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+        window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
+    }
 
-    // 4. EventSource (SSE)
     if (window.EventSource) {
         const OrigES = window.EventSource;
         window.EventSource = function(url, config) {
             return new OrigES(toProxy(url), config);
         };
+        window.EventSource.prototype = OrigES.prototype;
     }
 
-    // 5. Window Open & History API
+    // 4. Window Open & History API
     const origOpenWin = window.open;
     window.open = function(u, ...a) { return origOpenWin.call(this, u ? toProxy(u) : u, ...a); };
     const origPush = history.pushState, origReplace = history.replaceState;
     history.pushState = function(s, t, u) { return origPush.apply(this, [s, t, u ? toProxy(u) : u]); };
     history.replaceState = function(s, t, u) { return origReplace.apply(this, [s, t, u ? toProxy(u) : u]); };
 
-    // 6. DOM Attributes & Properties Interception
+    // 5. DOM Attributes & Properties Interception
     const origSetAttribute = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function(name, value) {
         const lowerName = name.toLowerCase();
-        if (['src', 'href', 'action', 'data-src', 'data-lazy-src', 'data-bg', 'poster', 'srcset', 'xlink:href', 'data-original', 'data-retina'].includes(lowerName) && typeof value === 'string') {
+        if (['src', 'href', 'action', 'data-src', 'data-lazy-src', 'data-bg', 'poster', 'xlink:href', 'data-original', 'data-retina'].includes(lowerName) && typeof value === 'string') {
             value = toProxy(value);
+        } else if (lowerName === 'srcset' && typeof value === 'string') {
+            value = rewriteSrcset(value);
         }
         return origSetAttribute.call(this, name, value);
     };
@@ -135,29 +179,34 @@ const JS_INJECTION = `
                 const origSet = descriptor.set;
                 Object.defineProperty(proto, prop, {
                     configurable: true, enumerable: true, get: descriptor.get,
-                    set: function(val) { if (typeof val === 'string') val = toProxy(val); return origSet.call(this, val); }
+                    set: function(val) {
+                        if (typeof val === 'string') {
+                            val = (prop === 'srcset') ? rewriteSrcset(val) : toProxy(val);
+                        }
+                        return origSet.call(this, val);
+                    }
                 });
             }
         }
     }
 
-    // 7. Dynamic CSS Injection Interception
+    // 6. Dynamic CSS Injection Interception
     const origInsertRule = CSSStyleSheet.prototype.insertRule;
     CSSStyleSheet.prototype.insertRule = function(rule, index) {
         if (typeof rule === 'string') {
-            rule = rule.replace(/url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/gi, (m, q, u) => "url(" + q + toProxy(u) + q + ")");
+            rule = rule.replace(new RegExp("url\\\\(\\\\s*(['\\\"]?)([^'\")]+)\\\\1\\\\s*\\\\)", "gi"), (m, q, u) => "url(" + q + toProxy(u) + q + ")");
         }
         return origInsertRule.call(this, rule, index);
     };
 
-    // 8. PostMessage Interception
+    // 7. PostMessage Interception
     const origPostMessage = window.postMessage;
     window.postMessage = function(message, targetOrigin, ...args) {
         if (typeof targetOrigin === 'string' && targetOrigin !== '*') targetOrigin = '*';
         return origPostMessage.call(this, message, targetOrigin, ...args);
     };
 
-    // 9. Document Write Interception
+    // 8. Document Write Interception
     const origWrite = document.write;
     const origWriteln = document.writeln;
     document.write = function(...args) {
@@ -167,7 +216,7 @@ const JS_INJECTION = `
         return origWriteln.apply(this, args.map(a => typeof a === 'string' ? rewriteHTMLString(a) : a));
     };
 
-    // 10. innerHTML / outerHTML Interception
+    // 9. innerHTML / outerHTML Interception
     const origInnerHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
     if (origInnerHTMLDesc && origInnerHTMLDesc.set) {
         Object.defineProperty(Element.prototype, 'innerHTML', {
@@ -185,12 +234,12 @@ const JS_INJECTION = `
     }
 
     function rewriteHTMLString(html) {
-        return html.replace(/(src|href|action|poster|srcset)\\s*=\\s*(['"])([^'"]+)\\2/gi, (m, attr, q, url) => {
+        return html.replace(new RegExp("(src|href|action|poster)\\\\s*=\\\\s*(['\\\"])([^'\"]+)\\\\2", "gi"), (m, attr, q, url) => {
             return attr + '=' + q + toProxy(url) + q;
         });
     }
 
-    // 11. MutationObserver
+    // 10. MutationObserver
     const observer = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
             if (mutation.type === 'childList') {
@@ -206,7 +255,7 @@ const JS_INJECTION = `
 
     function rewriteNode(el) {
         if (!el || !el.tagName) return;
-        const attrs = ['src', 'href', 'action', 'data-src', 'data-lazy-src', 'data-original', 'data-retina', 'data-bg', 'poster', 'srcset', 'xlink:href'];
+        const attrs = ['src', 'href', 'action', 'data-src', 'data-lazy-src', 'data-original', 'data-retina', 'data-bg', 'poster', 'xlink:href'];
         for (const attr of attrs) {
             if (el.hasAttribute(attr)) {
                 const val = el.getAttribute(attr);
@@ -216,11 +265,18 @@ const JS_INJECTION = `
                 }
             }
         }
+        if (el.hasAttribute('srcset')) {
+            const val = el.getAttribute('srcset');
+            if (val && typeof val === 'string') {
+                const newSrcset = rewriteSrcset(val);
+                if (newSrcset !== val) el.setAttribute('srcset', newSrcset);
+            }
+        }
     }
 
     observer.observe(document.documentElement, { childList: true, subtree: true });
 
-    // 12. AdBlock Injection
+    // 11. AdBlock Injection
     const adBlockStyle = document.createElement('style');
     const adBlockCSS = 'iframe[src*="magsrv.com"], iframe[src*="idzone="], iframe[src*="exoclick"], iframe[src*="popads"], iframe[src*="juicyads"], iframe[src*="trafficstars"], iframe[src*="iframe.php?"] { display: none !important; height: 0 !important; width: 0 !important; position: absolute !important; left: -9999px !important; } div[style*="text-align:center;"] { min-height: 0 !important; margin: 0 !important; padding: 0 !important; }';
     adBlockStyle.innerHTML = adBlockCSS;
@@ -243,6 +299,16 @@ const JS_INJECTION = `
 // ==========================================
 // 3. AUTHENTICATION & HELPERS
 // ==========================================
+function timingSafeEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    if (a.length !== b.length) return false;
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+        result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return result === 0;
+}
+
 function getAuthToken(env) {
     return btoa((env.PROXY_USER || '') + ':' + (env.PROXY_PASS || ''));
 }
@@ -250,12 +316,16 @@ function getAuthToken(env) {
 function authenticate(request, env) {
     const cookie = request.headers.get('Cookie') || '';
     const match = cookie.match(/proxy_session=([^;]+)/);
-    if (match && match[1] === getAuthToken(env)) return true;
+    if (match && timingSafeEqual(match[1], getAuthToken(env))) return true;
 
     const authHeader = request.headers.get('Authorization');
     if (authHeader && authHeader.startsWith('Basic ')) {
-        const [user, pass] = atob(authHeader.slice(6)).split(':');
-        return user === (env.PROXY_USER || '') && pass === (env.PROXY_PASS || '');
+        try {
+            const [user, pass] = atob(authHeader.slice(6)).split(':');
+            if (timingSafeEqual(user || '', env.PROXY_USER || '') && timingSafeEqual(pass || '', env.PROXY_PASS || '')) {
+                return true;
+            }
+        } catch {}
     }
     return false;
 }
@@ -273,11 +343,17 @@ function rewriteCSS(css, baseUrl, proxyHost, separator) {
     css = css.replace(/@import\s+(?:url\(\s*['"]?([^'")]+)['"]?\s*\)|['"]([^'"]+)['"])/gi, (m, u1, u2) => {
         const url = u1 || u2;
         if (!url || url.startsWith('data:') || url.includes('/' + separator)) return m;
-        try { return m.replace(url, `https://${proxyHost}/${separator}${new URL(url.startsWith('//') ? 'https:' + url : url, baseUrl).href}`); } catch { return m; }
+        try {
+            const abs = new URL(url.startsWith('//') ? 'https:' + url : url, baseUrl);
+            return m.replace(url, `https://${proxyHost}/${separator}${abs.href}`);
+        } catch { return m; }
     });
     css = css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (m, q, url) => {
         if (!url || url.startsWith('data:') || url.startsWith('blob:') || url.includes('/' + separator)) return m;
-        try { return `url(${q}https://${proxyHost}/${separator}${new URL(url.startsWith('//') ? 'https:' + url : url, baseUrl).href}${q})`; } catch { return m; }
+        try {
+            const abs = new URL(url.startsWith('//') ? 'https:' + url : url, baseUrl);
+            return `url(${q}https://${proxyHost}/${separator}${abs.href}${q})`;
+        } catch { return m; }
     });
     return css;
 }
@@ -320,21 +396,19 @@ class LinkRewriter {
         el.removeAttribute('integrity');
         el.removeAttribute('crossorigin');
         if (el.tagName === 'IFRAME') el.removeAttribute('sandbox');
+        
         const attrs = ['href', 'src', 'action', 'data', 'poster', 'xlink:href'];
         for (const attr of attrs) {
             if (el.hasAttribute(attr)) {
                 const val = el.getAttribute(attr);
-                if (!val || val.startsWith('data:') || val.startsWith('javascript:') || val.startsWith('blob:') || val.startsWith('#')) continue;
+                if (!val || val.startsWith('data:') || val.startsWith('javascript:') || val.startsWith('blob:') || val.startsWith('#') || val.startsWith('mailto:')) continue;
                 if (val.includes('/' + this.separator)) continue;
                 try {
                     let testVal = val;
                     if (testVal.startsWith('//')) testVal = 'https:' + testVal;
                     const abs = new URL(testVal, this.baseUrl);
-                    if (PASSTHROUGH_DOMAINS.some(d => abs.host.endsWith(d) || abs.host === d)) continue;
-                    let proxiedUrl = `https://${this.proxyHost}/${this.separator}${abs.origin}${abs.pathname}${abs.search}`;
-                    if (el.tagName === 'IFRAME') proxiedUrl += (abs.search ? '&' : '?') + '_proxy_iframe=1';
-                    proxiedUrl += abs.hash;
-                    el.setAttribute(attr, proxiedUrl);
+                    if (isPassthrough(abs.host)) continue;
+                    el.setAttribute(attr, `https://${this.proxyHost}/${this.separator}${abs.href}`);
                 } catch {}
             }
         }
@@ -352,7 +426,8 @@ class SrcsetRewriter {
                 if (!url || url.startsWith('data:')) return part;
                 try {
                     let testUrl = url.startsWith('//') ? 'https:' + url : url;
-                    return `https://${this.proxyHost}/${this.separator}${new URL(testUrl, this.baseUrl).href} ${rest.join(' ')}`.trim();
+                    const abs = new URL(testUrl, this.baseUrl);
+                    return `https://${this.proxyHost}/${this.separator}${abs.href} ${rest.join(' ')}`.trim();
                 } catch { return part; }
             }).join(', ');
             el.setAttribute('srcset', newSrcset);
@@ -372,24 +447,6 @@ class StyleRewriter {
 // ==========================================
 // 6. UI PAGES
 // ==========================================
-// Palette — dark (default):
-//   --bg      #0a0a14  black with a navy/violet undertone
-//   --panel   #131226  raised surface, deep indigo
-//   --line    #24223f  hairline borders
-//   --text    #f1f0f8  primary text
-//   --muted   #8b87a8  secondary text
-//   --signal  #a78bfa  violet "beacon" accent
-//   --ok      #6ee7b0  route-active green, used sparingly
-//
-// Palette — light:
-//   --bg      #f4f3fb  soft lavender-white
-//   --panel   #ffffff
-//   --line    #e2dff2
-//   --text    #17162a
-//   --muted   #6b6788
-//   --signal  #7c5cf5  deepened violet for AA contrast on white
-//   --ok      #12996b
-//
 function getHomePage(proxyHost, separator) {
     const html = `<!DOCTYPE html>
 <html lang="en">
@@ -401,190 +458,79 @@ function getHomePage(proxyHost, separator) {
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap');
 
 :root {
-  --bg: #0a0a14;
-  --panel: #131226;
-  --panel-hi: #17162e;
-  --line: #24223f;
-  --text: #f1f0f8;
-  --muted: #8b87a8;
-  --signal: #a78bfa;
-  --signal-ink: #17102f;
-  --signal-dim: rgba(167,139,250,0.16);
-  --ok: #6ee7b0;
+  --bg: #0a0a14; --panel: #131226; --panel-hi: #17162e; --line: #24223f;
+  --text: #f1f0f8; --muted: #8b87a8; --signal: #a78bfa; --signal-ink: #17102f;
+  --signal-dim: rgba(167,139,250,0.16); --ok: #6ee7b0;
 }
 html[data-theme="light"] {
-  --bg: #f4f3fb;
-  --panel: #ffffff;
-  --panel-hi: #faf9ff;
-  --line: #e2dff2;
-  --text: #17162a;
-  --muted: #6b6788;
-  --signal: #7c5cf5;
-  --signal-ink: #ffffff;
-  --signal-dim: rgba(124,92,245,0.12);
-  --ok: #12996b;
+  --bg: #f4f3fb; --panel: #ffffff; --panel-hi: #faf9ff; --line: #e2dff2;
+  --text: #17162a; --muted: #6b6788; --signal: #7c5cf5; --signal-ink: #ffffff;
+  --signal-dim: rgba(124,92,245,0.12); --ok: #12996b;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
 body {
-  font-family: 'Manrope', -apple-system, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  overflow: hidden;
-  padding: 24px;
-  transition: background 0.25s ease, color 0.25s ease;
+  font-family: 'Manrope', -apple-system, sans-serif; background: var(--bg); color: var(--text);
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  position: relative; overflow: hidden; padding: 24px; transition: background 0.25s ease, color 0.25s ease;
 }
 .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
-
-/* ---- theme toggle ---- */
 .theme-toggle {
-  position: fixed;
-  top: 22px; right: 22px;
-  z-index: 20;
-  width: 42px; height: 42px;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--panel-hi);
-  border: 1.5px solid var(--signal);
-  border-radius: 11px;
-  color: var(--signal);
-  cursor: pointer;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
-  transition: all 0.18s ease;
+  position: fixed; top: 22px; right: 22px; z-index: 20; width: 42px; height: 42px;
+  display: flex; align-items: center; justify-content: center; background: var(--panel-hi);
+  border: 1.5px solid var(--signal); border-radius: 11px; color: var(--signal);
+  cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,0.35); transition: all 0.18s ease;
 }
 .theme-toggle:hover { color: var(--signal-ink); background: var(--signal); }
 .theme-toggle svg { width: 19px; height: 19px; display: block; }
 .theme-toggle .sun { display: none; }
 html[data-theme="light"] .theme-toggle .moon { display: none; }
 html[data-theme="light"] .theme-toggle .sun { display: block; }
-
-/* ---- background route field ---- */
-.route-field {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  opacity: 0.55;
-}
+.route-field { position: absolute; inset: 0; z-index: 0; opacity: 0.55; }
 html[data-theme="light"] .route-field { opacity: 0.4; }
 .route-field svg { width: 100%; height: 100%; }
 .route-path { fill: none; stroke: var(--line); stroke-width: 1; }
 .route-node { fill: var(--line); }
 .route-node.active { fill: var(--signal); }
 .packet { fill: var(--signal); filter: drop-shadow(0 0 6px rgba(167,139,250,0.7)); }
-
-/* ---- layout ---- */
 .wrap { position: relative; z-index: 1; width: 100%; max-width: 640px; }
-
 .eyebrow {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.72rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 22px;
+  display: inline-flex; align-items: center; gap: 8px; font-size: 0.72rem;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 22px;
 }
-.eyebrow .dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--ok);
-  box-shadow: 0 0 8px rgba(110,231,176,0.9);
-}
-
-h1 {
-  font-size: clamp(2.4rem, 6vw, 3.4rem);
-  font-weight: 700;
-  letter-spacing: -0.03em;
-  line-height: 1.05;
-  margin-bottom: 14px;
-}
+.eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px rgba(110,231,176,0.9); }
+h1 { font-size: clamp(2.4rem, 6vw, 3.4rem); font-weight: 700; letter-spacing: -0.03em; line-height: 1.05; margin-bottom: 14px; }
 h1 span { color: var(--muted); font-weight: 500; }
-
-.sub {
-  color: var(--muted);
-  font-size: 1rem;
-  line-height: 1.5;
-  max-width: 46ch;
-  margin-bottom: 40px;
-}
-
-/* ---- address bar ---- */
+.sub { color: var(--muted); font-size: 1rem; line-height: 1.5; max-width: 46ch; margin-bottom: 40px; }
 .bar {
-  display: flex;
-  align-items: stretch;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 6px;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  display: flex; align-items: stretch; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 14px; padding: 6px; transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 .bar:focus-within { border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-dim); }
 .bar-flag {
-  display: flex;
-  align-items: center;
-  padding: 0 16px;
-  color: var(--muted);
-  font-size: 0.82rem;
-  border-right: 1px solid var(--line);
-  white-space: nowrap;
-  user-select: none;
+  display: flex; align-items: center; padding: 0 16px; color: var(--muted); font-size: 0.82rem;
+  border-right: 1px solid var(--line); white-space: nowrap; user-select: none;
 }
 input {
-  flex: 1;
-  min-width: 0;
-  background: transparent;
-  border: none;
-  outline: none;
-  color: var(--text);
-  font-size: 1.02rem;
-  padding: 14px 16px;
-  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  flex: 1; min-width: 0; background: transparent; border: none; outline: none;
+  color: var(--text); font-size: 1.02rem; padding: 14px 16px; font-family: 'IBM Plex Mono', ui-monospace, monospace;
 }
 input::placeholder { color: var(--muted); opacity: 0.6; }
-
 button {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: var(--signal);
-  color: var(--signal-ink);
-  border: none;
-  border-radius: 9px;
-  padding: 0 22px;
-  font-weight: 700;
-  font-size: 0.92rem;
-  cursor: pointer;
-  transition: transform 0.15s ease, filter 0.15s ease;
+  display: flex; align-items: center; gap: 8px; background: var(--signal); color: var(--signal-ink);
+  border: none; border-radius: 9px; padding: 0 22px; font-weight: 700; font-size: 0.92rem;
+  cursor: pointer; transition: transform 0.15s ease, filter 0.15s ease;
 }
 button:hover { filter: brightness(1.08); transform: translateY(-1px); }
 button:active { transform: translateY(0); }
 button svg { width: 15px; height: 15px; }
-
-/* ---- shortcuts ---- */
 .hops { display: flex; align-items: center; gap: 10px; margin-top: 34px; flex-wrap: wrap; }
-.hops .label {
-  font-size: 0.72rem;
-  color: var(--muted);
-  opacity: 0.75;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  margin-right: 4px;
-}
+.hops .label { font-size: 0.72rem; color: var(--muted); opacity: 0.75; letter-spacing: 0.1em; text-transform: uppercase; margin-right: 4px; }
 .hops a {
-  color: var(--muted);
-  text-decoration: none;
-  font-size: 0.86rem;
-  padding: 7px 14px;
-  border: 1px solid var(--line);
-  border-radius: 99px;
-  transition: all 0.18s ease;
+  color: var(--muted); text-decoration: none; font-size: 0.86rem; padding: 7px 14px;
+  border: 1px solid var(--line); border-radius: 99px; transition: all 0.18s ease;
 }
 .hops a:hover { color: var(--text); border-color: var(--signal); background: var(--signal-dim); }
-
 @media (max-width: 520px) {
   .bar { flex-direction: column; gap: 8px; }
   .bar-flag { border-right: none; border-bottom: 1px solid var(--line); padding: 10px 12px; }
@@ -599,22 +545,8 @@ button svg { width: 15px; height: 15px; }
 <body>
 
 <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme" type="button">
-  <svg class="moon" width="19" height="19" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-    <path fill="currentColor" d="M12.3 2.5c.3 0 .6.2.5.5-.7 4 1.9 8 6 8.7.3.1.4.5.1.7A9.5 9.5 0 1 1 11.6 2.6c.2-.1.5-.1.7-.1z"/>
-  </svg>
-  <svg class="sun" width="19" height="19" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-    <circle cx="12" cy="12" r="4.5" fill="currentColor"/>
-    <g fill="currentColor">
-      <rect x="11" y="1" width="2" height="4" rx="1"/>
-      <rect x="11" y="19" width="2" height="4" rx="1"/>
-      <rect x="1" y="11" width="4" height="2" rx="1"/>
-      <rect x="19" y="11" width="4" height="2" rx="1"/>
-      <rect x="3.5" y="3.5" width="2" height="4" rx="1" transform="rotate(-45 4.5 5.5)"/>
-      <rect x="18.5" y="16.5" width="2" height="4" rx="1" transform="rotate(-45 19.5 18.5)"/>
-      <rect x="16.5" y="3.5" width="2" height="4" rx="1" transform="rotate(45 17.5 5.5)"/>
-      <rect x="3.5" y="16.5" width="2" height="4" rx="1" transform="rotate(45 4.5 18.5)"/>
-    </g>
-  </svg>
+  <svg class="moon" width="19" height="19" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12.3 2.5c.3 0 .6.2.5.5-.7 4 1.9 8 6 8.7.3.1.4.5.1.7A9.5 9.5 0 1 1 11.6 2.6c.2-.1.5-.1.7-.1z"/></svg>
+  <svg class="sun" width="19" height="19" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="4.5" fill="currentColor"/><g fill="currentColor"><rect x="11" y="1" width="2" height="4" rx="1"/><rect x="11" y="19" width="2" height="4" rx="1"/><rect x="1" y="11" width="4" height="2" rx="1"/><rect x="19" y="11" width="4" height="2" rx="1"/><rect x="3.5" y="3.5" width="2" height="4" rx="1" transform="rotate(-45 4.5 5.5)"/><rect x="18.5" y="16.5" width="2" height="4" rx="1" transform="rotate(-45 19.5 18.5)"/><rect x="16.5" y="3.5" width="2" height="4" rx="1" transform="rotate(45 17.5 5.5)"/><rect x="3.5" y="16.5" width="2" height="4" rx="1" transform="rotate(45 4.5 18.5)"/></g></svg>
 </button>
 
 <div class="route-field" aria-hidden="true">
@@ -627,16 +559,8 @@ button svg { width: 15px; height: 15px; }
     <circle class="route-node" cx="300" cy="330" r="3"></circle>
     <circle class="route-node active" cx="560" cy="392" r="3.5"></circle>
     <circle class="route-node" cx="800" cy="470" r="3"></circle>
-    <circle class="packet" r="3.2">
-      <animateMotion dur="7s" repeatCount="indefinite" begin="0s">
-        <mpath href="#p1"></mpath>
-      </animateMotion>
-    </circle>
-    <circle class="packet" r="3.2">
-      <animateMotion dur="9s" repeatCount="indefinite" begin="1.5s">
-        <mpath href="#p2"></mpath>
-      </animateMotion>
-    </circle>
+    <circle class="packet" r="3.2"><animateMotion dur="7s" repeatCount="indefinite" begin="0s"><mpath href="#p1"></mpath></animateMotion></circle>
+    <circle class="packet" r="3.2"><animateMotion dur="9s" repeatCount="indefinite" begin="1.5s"><mpath href="#p2"></mpath></animateMotion></circle>
   </svg>
 </div>
 
@@ -658,7 +582,7 @@ button svg { width: 15px; height: 15px; }
     <span class="label mono">quick hops</span>
     <a href="/${separator}https://wikipedia.org/">Wikipedia</a>
     <a href="/${separator}https://reddit.com/">Reddit</a>
-	<a href="/${separator}https://ext.to/">ExtTo</a>
+    <a href="/${separator}https://ext.to/">ExtTo</a>
     <a href="/${separator}https://browserleaks.com/ip">BrowserLeaks</a>
   </div>
 </div>
@@ -704,167 +628,67 @@ function getLoginPage(error = false) {
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap');
 
 :root {
-  --bg: #0a0a14;
-  --panel: #131226;
-  --field: #0e0d1c;
-  --line: #24223f;
-  --text: #f1f0f8;
-  --muted: #8b87a8;
-  --signal: #a78bfa;
-  --signal-ink: #17102f;
-  --signal-dim: rgba(167,139,250,0.16);
-  --err: #f0768a;
-  --err-dim: rgba(240,118,138,0.12);
+  --bg: #0a0a14; --panel: #131226; --field: #0e0d1c; --line: #24223f;
+  --text: #f1f0f8; --muted: #8b87a8; --signal: #a78bfa; --signal-ink: #17102f;
+  --signal-dim: rgba(167,139,250,0.16); --err: #f0768a; --err-dim: rgba(240,118,138,0.12);
 }
 html[data-theme="light"] {
-  --bg: #f4f3fb;
-  --panel: #ffffff;
-  --field: #f7f6fd;
-  --line: #e2dff2;
-  --text: #17162a;
-  --muted: #6b6788;
-  --signal: #7c5cf5;
-  --signal-ink: #ffffff;
-  --signal-dim: rgba(124,92,245,0.12);
-  --err: #d63d5c;
-  --err-dim: rgba(214,61,92,0.08);
+  --bg: #f4f3fb; --panel: #ffffff; --field: #f7f6fd; --line: #e2dff2;
+  --text: #17162a; --muted: #6b6788; --signal: #7c5cf5; --signal-ink: #ffffff;
+  --signal-dim: rgba(124,92,245,0.12); --err: #d63d5c; --err-dim: rgba(214,61,92,0.08);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
 body {
-  font-family: 'Manrope', -apple-system, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  position: relative;
-  transition: background 0.25s ease, color 0.25s ease;
+  font-family: 'Manrope', -apple-system, sans-serif; background: var(--bg); color: var(--text);
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 24px; position: relative; transition: background 0.25s ease, color 0.25s ease;
 }
 .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
-
 .theme-toggle {
-  position: fixed;
-  top: 22px; right: 22px;
-  z-index: 20;
-  width: 42px; height: 42px;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--panel);
-  border: 1.5px solid var(--signal);
-  border-radius: 11px;
-  color: var(--signal);
-  cursor: pointer;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
-  transition: all 0.18s ease;
+  position: fixed; top: 22px; right: 22px; z-index: 20; width: 42px; height: 42px;
+  display: flex; align-items: center; justify-content: center; background: var(--panel);
+  border: 1.5px solid var(--signal); border-radius: 11px; color: var(--signal);
+  cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,0.35); transition: all 0.18s ease;
 }
 .theme-toggle:hover { color: var(--signal-ink); background: var(--signal); }
 .theme-toggle svg { width: 19px; height: 19px; display: block; }
 .theme-toggle .sun { display: none; }
 html[data-theme="light"] .theme-toggle .moon { display: none; }
 html[data-theme="light"] .theme-toggle .sun { display: block; }
-
-.card {
-  width: 100%;
-  max-width: 380px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 38px 34px;
-}
-
-.badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 40px; height: 40px;
-  border-radius: 10px;
-  background: var(--signal-dim);
-  color: var(--signal);
-  margin-bottom: 20px;
-}
+.card { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 38px 34px; }
+.badge { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 10px; background: var(--signal-dim); color: var(--signal); margin-bottom: 20px; }
 .badge svg { width: 20px; height: 20px; }
-
 h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 6px; }
 .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 26px; }
-
 .err {
-  display: ${error ? 'flex' : 'none'};
-  align-items: center;
-  gap: 8px;
-  background: var(--err-dim);
-  color: var(--err);
-  border: 1px solid rgba(240,118,138,0.25);
-  padding: 11px 14px;
-  border-radius: 10px;
-  font-size: 0.85rem;
-  margin-bottom: 22px;
+  display: ${error ? 'flex' : 'none'}; align-items: center; gap: 8px;
+  background: var(--err-dim); color: var(--err); border: 1px solid rgba(240,118,138,0.25);
+  padding: 11px 14px; border-radius: 10px; font-size: 0.85rem; margin-bottom: 22px;
 }
-
 .field { margin-bottom: 18px; }
-label {
-  display: block;
-  font-size: 0.72rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
+label { display: block; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
 input {
-  width: 100%;
-  padding: 12px 14px;
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  color: var(--text);
-  font-size: 0.95rem;
-  outline: none;
+  width: 100%; padding: 12px 14px; background: var(--field); border: 1px solid var(--line);
+  border-radius: 10px; color: var(--text); font-size: 0.95rem; outline: none;
   transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
 input:focus { border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-dim); }
-
 button {
-  width: 100%;
-  padding: 13px;
-  background: var(--signal);
-  color: var(--signal-ink);
-  border: none;
-  border-radius: 10px;
-  font-weight: 700;
-  font-size: 0.95rem;
-  cursor: pointer;
-  margin-top: 6px;
-  transition: transform 0.15s ease, filter 0.15s ease;
+  width: 100%; padding: 13px; background: var(--signal); color: var(--signal-ink);
+  border: none; border-radius: 10px; font-weight: 700; font-size: 0.95rem; cursor: pointer;
+  margin-top: 6px; transition: transform 0.15s ease, filter 0.15s ease;
 }
 button:hover { filter: brightness(1.08); transform: translateY(-1px); }
 button:active { transform: translateY(0); }
-
 .foot { margin-top: 20px; text-align: center; font-size: 0.76rem; color: var(--muted); opacity: 0.8; }
-
-@media (max-width: 460px) {
-  .theme-toggle { top: 16px; right: 16px; }
-}
+@media (max-width: 460px) { .theme-toggle { top: 16px; right: 16px; } }
 </style>
 </head>
 <body>
 <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme" type="button">
-  <svg class="moon" width="19" height="19" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-    <path fill="currentColor" d="M12.3 2.5c.3 0 .6.2.5.5-.7 4 1.9 8 6 8.7.3.1.4.5.1.7A9.5 9.5 0 1 1 11.6 2.6c.2-.1.5-.1.7-.1z"/>
-  </svg>
-  <svg class="sun" width="19" height="19" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-    <circle cx="12" cy="12" r="4.5" fill="currentColor"/>
-    <g fill="currentColor">
-      <rect x="11" y="1" width="2" height="4" rx="1"/>
-      <rect x="11" y="19" width="2" height="4" rx="1"/>
-      <rect x="1" y="11" width="4" height="2" rx="1"/>
-      <rect x="19" y="11" width="4" height="2" rx="1"/>
-      <rect x="3.5" y="3.5" width="2" height="4" rx="1" transform="rotate(-45 4.5 5.5)"/>
-      <rect x="18.5" y="16.5" width="2" height="4" rx="1" transform="rotate(-45 19.5 18.5)"/>
-      <rect x="16.5" y="3.5" width="2" height="4" rx="1" transform="rotate(45 17.5 5.5)"/>
-      <rect x="3.5" y="16.5" width="2" height="4" rx="1" transform="rotate(45 4.5 18.5)"/>
-    </g>
-  </svg>
+  <svg class="moon" width="19" height="19" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12.3 2.5c.3 0 .6.2.5.5-.7 4 1.9 8 6 8.7.3.1.4.5.1.7A9.5 9.5 0 1 1 11.6 2.6c.2-.1.5-.1.7-.1z"/></svg>
+  <svg class="sun" width="19" height="19" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="4.5" fill="currentColor"/><g fill="currentColor"><rect x="11" y="1" width="2" height="4" rx="1"/><rect x="11" y="19" width="2" height="4" rx="1"/><rect x="1" y="11" width="4" height="2" rx="1"/><rect x="19" y="11" width="4" height="2" rx="1"/><rect x="3.5" y="3.5" width="2" height="4" rx="1" transform="rotate(-45 4.5 5.5)"/><rect x="18.5" y="16.5" width="2" height="4" rx="1" transform="rotate(-45 19.5 18.5)"/><rect x="16.5" y="3.5" width="2" height="4" rx="1" transform="rotate(45 17.5 5.5)"/><rect x="3.5" y="16.5" width="2" height="4" rx="1" transform="rotate(45 4.5 18.5)"/></g></svg>
 </button>
 
 <form class="card" method="POST" action="/login">
@@ -925,7 +749,7 @@ export default {
                 const form = await request.formData();
                 const u = form.get('username') || '';
                 const p = form.get('password') || '';
-                if (u === (env.PROXY_USER || '') && p === (env.PROXY_PASS || '')) {
+                if (timingSafeEqual(u, env.PROXY_USER || '') && timingSafeEqual(p, env.PROXY_PASS || '')) {
                     return new Response(null, {
                         status: 302,
                         headers: {
@@ -956,12 +780,11 @@ export default {
         let targetUrlStr = extractTargetUrl(url.pathname, separator);
         if (!targetUrlStr) return new Response('Invalid Proxy URL.', { status: 400 });
 
-        // Append query parameters from the proxy request to the target URL.
-        // url.pathname does NOT include the query string (e.g., ?topic=123), which causes
-        // forums to drop topic IDs and show "The requested topic does not exist."
-        let fullTargetStr = targetUrlStr + url.search;
+        let fullTargetStr = targetUrlStr;
+        if (url.search) {
+            fullTargetStr += (targetUrlStr.includes('?') ? '&' : '?') + url.search.slice(1);
+        }
 
-        // Clean up proxy-specific params that shouldn't be sent to the origin
         try {
             let cleanUrl = new URL(fullTargetStr);
             cleanUrl.searchParams.delete('_proxy_iframe');
@@ -977,20 +800,17 @@ export default {
 
         // 5. Build Proxied Request
         const newHeaders = new Headers();
-        const keepHeaders = ['cookie', 'range', 'if-none-match', 'if-modified-since', 'content-type', 'content-length'];
+        const keepHeaders = ['cookie', 'range', 'if-none-match', 'if-modified-since', 'content-type', 'content-length', 'accept-encoding'];
         for (const h of keepHeaders) if (request.headers.has(h)) newHeaders.set(h, request.headers.get(h));
+        
         const passThrough = ['accept', 'accept-language', 'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform'];
         for (const h of passThrough) if (request.headers.has(h)) newHeaders.set(h, request.headers.get(h));
-        
-        // Remove Accept-Encoding so origin sends uncompressed HTML/CSS/JS.
-        newHeaders.delete('accept-encoding');
 
         const emu = CONFIG.browserEmulation;
         if (!newHeaders.has('User-Agent')) newHeaders.set('User-Agent', emu.userAgent);
         if (!newHeaders.has('Accept')) newHeaders.set('Accept', emu.accept);
-        newHeaders.set('Host', targetUrl.host);
+        if (!newHeaders.has('Accept-Language')) newHeaders.set('Accept-Language', emu.acceptLanguage);
 
-        // YouTube Referer/Origin issues
         if (targetUrl.host.includes('googlevideo.com') || targetUrl.host.includes('ytimg.com') || targetUrl.host.includes('youtube.com')) {
             newHeaders.set('Referer', 'https://www.youtube.com/');
             newHeaders.set('Origin', 'https://www.youtube.com');
@@ -1008,14 +828,13 @@ export default {
 
         // 6. Fetch & Cache Check
         const cache = caches.default;
-        const cacheKey = new Request(request.url, request);
+        const cacheKey = new Request(new URL(request.url), { method: 'GET' });
         let response = await cache.match(cacheKey);
 
         if (!response) {
             response = await fetch(proxiedReq);
             let respHeaders = new Headers(response.headers);
 
-            // Handle Redirects
             if ([301, 302, 303, 307, 308].includes(response.status)) {
                 const loc = respHeaders.get('Location');
                 if (loc) {
@@ -1026,16 +845,14 @@ export default {
                 }
             }
 
-            // Strip Security Headers
             const stripHeaders = ['content-security-policy', 'content-security-policy-report-only', 'x-frame-options', 'x-content-type-options', 'strict-transport-security', 'referrer-policy', 'cross-origin-resource-policy', 'cross-origin-embedder-policy', 'cross-origin-opener-policy', 'permissions-policy'];
             stripHeaders.forEach(h => respHeaders.delete(h));
 
-            // CORS
             respHeaders.set('Access-Control-Allow-Origin', '*');
             respHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
             respHeaders.set('Access-Control-Allow-Headers', '*');
+            respHeaders.set('Access-Control-Allow-Credentials', 'true');
 
-            // Path-based Cookie Isolation
             const setCookies = respHeaders.getSetCookie ? respHeaders.getSetCookie() : [];
             if (setCookies && setCookies.length > 0) {
                 respHeaders.delete('Set-Cookie');
@@ -1056,28 +873,37 @@ export default {
             const contentType = respHeaders.get('Content-Type') || '';
             const lowerUrl = targetUrl.pathname.toLowerCase();
 
-            // Detect CF Challenge to handle it specially
             const isCfChallenge = (response.status === 403 || response.status === 503) &&
                 (respHeaders.get('server')?.startsWith('cloudflare') || targetUrl.pathname.includes('/cdn-cgi/'));
-
-            // Check if request is for an iframe (to skip JS injection)
-            const isIframe = url.searchParams.has('_proxy_iframe');
 
             let finalBody = response.body;
             let bodyModified = false;
 
-            // HTML Rewriting
             if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml')) {
                 try {
                     const rewriter = new HTMLRewriter()
-                        .on('base', { element(el) { el.remove(); } }) // Remove base tag to fix relative URLs
                         .on('meta[http-equiv]', {
                             element(el) {
                                 const equiv = el.getAttribute('http-equiv');
-                                if (equiv && (equiv.toLowerCase().includes('content-security-policy') || equiv.toLowerCase().includes('x-ua-compatible'))) el.remove();
+                                if (!equiv) return;
+                                const lowerEquiv = equiv.toLowerCase();
+                                if (lowerEquiv.includes('content-security-policy') || lowerEquiv.includes('x-ua-compatible')) {
+                                    el.remove();
+                                } else if (lowerEquiv === 'refresh') {
+                                    const content = el.getAttribute('content');
+                                    if (content) {
+                                        const match = content.match(/^(\d+;\s*url=)(.*)$/i);
+                                        if (match && match[2]) {
+                                            try {
+                                                const abs = new URL(match[2].trim(), targetUrl);
+                                                el.setAttribute('content', `${match[1]}https://${proxyHost}/${separator}${abs.href}`);
+                                            } catch {}
+                                        }
+                                    }
+                                }
                             }
                         })
-                        .on('a[href], link[href], script[src], img[src], iframe[src], form[action], video[src], audio[src], source[src], embed[src], object[data], track[src]', new LinkRewriter(targetUrl, proxyHost, separator))
+                        .on('a[href], link[href], script[src], img[src], iframe[src], form[action], video[src], audio[src], source[src], embed[src], object[data], track[src], base[href]', new LinkRewriter(targetUrl, proxyHost, separator))
                         .on('img[data-src], img[data-lazy-src], img[data-original], img[data-retina], div[data-bg], *[data-background]', {
                             element(el) {
                                 const attrs = ['data-src', 'data-lazy-src', 'data-original', 'data-retina', 'data-bg', 'data-background'];
@@ -1094,14 +920,13 @@ export default {
                         .on('style', { text(text) { text.replace(rewriteCSS(text.text, targetUrl, proxyHost, separator)); } })
                         .on('script', {
                             text(textChunk) {
-                                // ONLY rewrite script text for CF Challenges where JS_INJECTION is skipped
                                 if (isCfChallenge) {
                                     let content = textChunk.text;
                                     content = content.replace(/(["'])(https?:\/\/[^"']+)\1/g, (match, quote, url) => {
                                         if (url.includes('/' + separator)) return match;
                                         try {
                                             const abs = new URL(url, targetUrl);
-                                            if (PASSTHROUGH_DOMAINS.some(d => abs.host.endsWith(d))) return match;
+                                            if (isPassthrough(abs.host)) return match;
                                             return `${quote}https://${proxyHost}/${separator}${abs.href}${quote}`;
                                         } catch { return match; }
                                     });
@@ -1113,18 +938,16 @@ export default {
                             }
                         });
 
-                    // Only inject JS if NOT a CF challenge and NOT an iframe
-                    if (!isCfChallenge && !isIframe) {
+                    if (!isCfChallenge) {
                         rewriter.on('head', { element(el) { el.prepend(JS_INJECTION, { html: true }); } });
                     }
 
                     finalBody = rewriter.transform(response).body;
                     bodyModified = true;
                 } catch (e) {
-                    finalBody = response.body; // Fallback if rewriting fails
+                    finalBody = response.body;
                 }
             }
-            // CSS Rewriting
             else if (contentType.includes('text/css')) {
                 try {
                     const text = await response.text();
@@ -1132,7 +955,6 @@ export default {
                     bodyModified = true;
                 } catch {}
             }
-            // HLS (m3u8) Rewriting
             else if (contentType.includes('application/vnd.apple.mpegurl') || contentType.includes('application/x-mpegurl') || lowerUrl.endsWith('.m3u8')) {
                 try {
                     const text = await response.text();
@@ -1140,7 +962,6 @@ export default {
                     bodyModified = true;
                 } catch {}
             }
-            // DASH (mpd) Rewriting
             else if (contentType.includes('application/dash+xml') || lowerUrl.endsWith('.mpd')) {
                 try {
                     const text = await response.text();
@@ -1160,7 +981,6 @@ export default {
                 headers: respHeaders
             });
 
-            // Cache Static Assets
             if (request.method === 'GET' && response.status === 200 && !bodyModified) {
                 if (contentType.startsWith('image/') || contentType.startsWith('font/') || contentType.startsWith('video/') || contentType.startsWith('audio/') || contentType.includes('javascript') || contentType.includes('text/css')) {
                     ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
